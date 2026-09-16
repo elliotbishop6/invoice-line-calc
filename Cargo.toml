@@ -1,0 +1,7 @@
+[package]
+name = "lineitems"
+version = "0.1.0"
+edition = "2021"
+authors = ["elliotbishop6"]
+description = "Invoice line item math: quantities, discounts, and tax without floating point"
+license = "MIT"
