@@ -231,6 +231,232 @@ impl fmt::Display for ParseQuantityError {
 
 impl std::error::Error for ParseQuantityError {}
 
+/// Parses a headered CSV invoice into `LineItem`s. Column order in the
+/// header doesn't matter; `discount_bps` and `tax_bps` are optional and
+/// default to 0 when the column is absent, since most lines on a real
+/// invoice have neither a discount nor tax.
+pub mod csv {
+    use super::{LineItem, Money, Quantity};
+    use std::fmt;
+
+    const REQUIRED: [&str; 3] = ["description", "quantity", "unit_price"];
+    const KNOWN: [&str; 5] = ["description", "quantity", "unit_price", "discount_bps", "tax_bps"];
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum CsvError {
+        MissingHeader,
+        MissingColumn(&'static str),
+        UnknownColumn(String),
+        WrongFieldCount { line: usize, expected: usize, got: usize },
+        InvalidField { line: usize, column: &'static str, message: String },
+    }
+
+    impl fmt::Display for CsvError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                CsvError::MissingHeader => write!(f, "file has no header row"),
+                CsvError::MissingColumn(name) => write!(f, "header is missing required column {name:?}"),
+                CsvError::UnknownColumn(name) => write!(f, "header has unrecognized column {name:?}"),
+                CsvError::WrongFieldCount { line, expected, got } => {
+                    write!(f, "line {line}: expected {expected} fields (matching the header), got {got}")
+                }
+                CsvError::InvalidField { line, column, message } => {
+                    write!(f, "line {line}: column {column:?}: {message}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for CsvError {}
+
+    struct Columns {
+        description: usize,
+        quantity: usize,
+        unit_price: usize,
+        discount_bps: Option<usize>,
+        tax_bps: Option<usize>,
+    }
+
+    impl Columns {
+        fn from_header(header: &[String]) -> Result<Self, CsvError> {
+            for name in header {
+                if !KNOWN.contains(&name.as_str()) {
+                    return Err(CsvError::UnknownColumn(name.clone()));
+                }
+            }
+
+            let find = |name: &'static str| {
+                header.iter().position(|h| h == name).ok_or(CsvError::MissingColumn(name))
+            };
+
+            Ok(Columns {
+                description: find("description")?,
+                quantity: find("quantity")?,
+                unit_price: find("unit_price")?,
+                discount_bps: header.iter().position(|h| h == "discount_bps"),
+                tax_bps: header.iter().position(|h| h == "tax_bps"),
+            })
+        }
+    }
+
+    /// Parses a full CSV document: a header row followed by one line item
+    /// per row. Blank lines and lines starting with `#` are skipped
+    /// wherever they appear, including before the header.
+    pub fn parse(input: &str) -> Result<Vec<LineItem>, CsvError> {
+        let mut rows = input.lines().enumerate().filter(|(_, line)| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        });
+
+        let (_, header_line) = rows.next().ok_or(CsvError::MissingHeader)?;
+        let header: Vec<String> =
+            split_line(header_line).into_iter().map(|f| f.to_ascii_lowercase()).collect();
+        let columns = Columns::from_header(&header)?;
+
+        let mut items = Vec::new();
+        for (index, line) in rows {
+            let line_no = index + 1;
+            let fields = split_line(line);
+            if fields.len() != header.len() {
+                return Err(CsvError::WrongFieldCount { line: line_no, expected: header.len(), got: fields.len() });
+            }
+
+            let description = fields[columns.description].clone();
+
+            let quantity: Quantity = fields[columns.quantity].parse().map_err(|e: super::ParseQuantityError| {
+                CsvError::InvalidField { line: line_no, column: "quantity", message: e.to_string() }
+            })?;
+
+            let unit_price: Money = fields[columns.unit_price].parse().map_err(|e: super::ParseMoneyError| {
+                CsvError::InvalidField { line: line_no, column: "unit_price", message: e.to_string() }
+            })?;
+
+            let discount_bps = match columns.discount_bps {
+                Some(i) => fields[i].parse::<u32>().map_err(|_| CsvError::InvalidField {
+                    line: line_no,
+                    column: "discount_bps",
+                    message: format!("invalid integer {:?}", fields[i]),
+                })?,
+                None => 0,
+            };
+
+            let tax_bps = match columns.tax_bps {
+                Some(i) => fields[i].parse::<u32>().map_err(|_| CsvError::InvalidField {
+                    line: line_no,
+                    column: "tax_bps",
+                    message: format!("invalid integer {:?}", fields[i]),
+                })?,
+                None => 0,
+            };
+
+            items.push(LineItem { description, quantity, unit_price, discount_bps, tax_bps });
+        }
+
+        Ok(items)
+    }
+
+    /// Splits one CSV line into fields, honoring double-quoted fields (so a
+    /// description can contain a comma) with `""` as an escaped quote.
+    /// Unquoted fields are trimmed; quoted fields are taken verbatim so
+    /// deliberate leading/trailing space survives.
+    fn split_line(line: &str) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut field = String::new();
+        let mut in_quotes = false;
+        let mut quoted = false;
+        let mut chars = line.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if in_quotes {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        field.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    field.push(c);
+                }
+            } else if c == '"' && field.is_empty() {
+                in_quotes = true;
+                quoted = true;
+            } else if c == ',' {
+                fields.push(if quoted { std::mem::take(&mut field) } else { field.trim().to_string() });
+                field.clear();
+                quoted = false;
+            } else {
+                field.push(c);
+            }
+        }
+        fields.push(if quoted { field } else { field.trim().to_string() });
+
+        fields
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_header_in_any_column_order() {
+            let input = "unit_price,description,quantity\n10.00,Widget,2\n";
+            let items = parse(input).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].description, "Widget");
+            assert_eq!(items[0].quantity.to_string(), "2.000");
+            assert_eq!(items[0].unit_price.to_string(), "10.00");
+            assert_eq!(items[0].discount_bps, 0);
+            assert_eq!(items[0].tax_bps, 0);
+        }
+
+        #[test]
+        fn quoted_field_can_contain_a_comma() {
+            let input = "description,quantity,unit_price\n\"Consulting, on-site\",1,50.00\n";
+            let items = parse(input).unwrap();
+            assert_eq!(items[0].description, "Consulting, on-site");
+        }
+
+        #[test]
+        fn skips_blank_and_comment_lines_before_and_after_header() {
+            let input = "# invoice\n\ndescription,quantity,unit_price\n\n# a widget\nWidget,1,5.00\n";
+            let items = parse(input).unwrap();
+            assert_eq!(items.len(), 1);
+        }
+
+        #[test]
+        fn optional_columns_default_to_zero() {
+            let input = "description,quantity,unit_price,tax_bps\nWidget,1,5.00,825\n";
+            let items = parse(input).unwrap();
+            assert_eq!(items[0].discount_bps, 0);
+            assert_eq!(items[0].tax_bps, 825);
+        }
+
+        #[test]
+        fn missing_required_column_is_an_error() {
+            let input = "quantity,unit_price\n1,5.00\n";
+            assert_eq!(parse(input), Err(CsvError::MissingColumn("description")));
+        }
+
+        #[test]
+        fn unknown_column_is_an_error() {
+            let input = "description,quantity,unit_price,sku\nWidget,1,5.00,ABC\n";
+            assert_eq!(parse(input), Err(CsvError::UnknownColumn("sku".to_string())));
+        }
+
+        #[test]
+        fn wrong_field_count_is_an_error() {
+            let input = "description,quantity,unit_price\nWidget,1\n";
+            assert_eq!(parse(input), Err(CsvError::WrongFieldCount { line: 2, expected: 3, got: 2 }));
+        }
+
+        #[test]
+        fn empty_input_is_an_error() {
+            assert_eq!(parse(""), Err(CsvError::MissingHeader));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

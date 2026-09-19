@@ -48,12 +48,18 @@ producing a wrong number.
 
 ## CLI usage
 
-The CLI reads lines of `description,quantity,unit_price,discount_bps,tax_bps`
-from a file argument or stdin, blank lines and `#`-comments are skipped:
+The CLI reads a headered CSV invoice from a file argument or stdin. The
+header names the columns present — `description`, `quantity`, and
+`unit_price` are required; `discount_bps` and `tax_bps` are optional and
+default to 0 when omitted, and columns can appear in any order. Blank
+lines and `#`-comments are skipped anywhere in the file, including before
+the header. A field can be double-quoted to contain a comma (`""` inside
+a quoted field is a literal quote):
 
 ```
 # invoice.csv
-Consulting, on-site,2.5,150.00,1000,825
+description,quantity,unit_price,discount_bps,tax_bps
+"Consulting, on-site",2.5,150.00,1000,825
 Widget,10,4.99,0,825
 Returned widget,-2,4.99,0,825
 ```
@@ -68,9 +74,13 @@ grand total                                                                     
 
 ## Status
 
-This is a first pass: the core pricing math and a table-driven test suite
-covering the rounding edge cases live in `src/lib.rs`. The CLI is
-deliberately minimal. No third-party dependencies — standard library only.
+This is a first pass: the core pricing math, the CSV parser, and
+table-driven test suites covering the rounding and parsing edge cases live
+in `src/lib.rs`. The CLI is deliberately minimal. No third-party
+dependencies — standard library only.
+
+Not done yet: JSON invoice input, multiple tax rates per line, a
+half-even rounding mode, and a JSON output mode for the CLI.
 
 ## License
 
