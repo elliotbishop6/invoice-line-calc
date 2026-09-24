@@ -48,10 +48,13 @@ producing a wrong number.
 
 ## CLI usage
 
-The CLI reads a headered CSV invoice from a file argument or stdin. The
-header names the columns present — `description`, `quantity`, and
-`unit_price` are required; `discount_bps` and `tax_bps` are optional and
-default to 0 when omitted, and columns can appear in any order. Blank
+The CLI reads an invoice from a file argument or stdin, as either headered
+CSV or JSON. A `.json` file extension selects the JSON parser; anything
+else is read as CSV, unless the input (including stdin) starts with `[`.
+
+CSV: the header names the columns present — `description`, `quantity`,
+and `unit_price` are required; `discount_bps` and `tax_bps` are optional
+and default to 0 when omitted, and columns can appear in any order. Blank
 lines and `#`-comments are skipped anywhere in the file, including before
 the header. A field can be double-quoted to contain a comma (`""` inside
 a quoted field is a literal quote):
@@ -72,15 +75,38 @@ Returned widget               qty     -2.000  subtotal     -9.98  discount      
 grand total                                                                                                    408.56
 ```
 
+JSON: a top-level array of objects, one per line item, with the same
+fields as the CSV columns. `quantity` and `unit_price` are given as JSON
+strings rather than numbers — a JSON number is a float, and floats are
+exactly what this library avoids. `discount_bps` and `tax_bps` are plain
+integers and default to 0 when omitted:
+
+```
+# invoice.json
+[
+  {"description": "Consulting, on-site", "quantity": "2.5", "unit_price": "150.00", "discount_bps": 1000, "tax_bps": 825},
+  {"description": "Widget", "quantity": "10", "unit_price": "4.99", "tax_bps": 825}
+]
+```
+
+```
+$ cargo run -- invoice.json
+Consulting, on-site          qty      2.500  subtotal     375.00  discount      37.50  tax      27.84  total     365.34
+Widget                       qty     10.000  subtotal      49.90  discount       0.00  tax       4.12  total      54.02
+grand total                                                                                                    419.36
+```
+
 ## Status
 
-This is a first pass: the core pricing math, the CSV parser, and
+This is a first pass: the core pricing math, the CSV and JSON parsers, and
 table-driven test suites covering the rounding and parsing edge cases live
-in `src/lib.rs`. The CLI is deliberately minimal. No third-party
-dependencies — standard library only.
+in `src/lib.rs`. The JSON parser is hand-rolled rather than pulling in
+serde — reading five fields off an array of objects doesn't justify a
+dependency. The CLI is deliberately minimal. No third-party dependencies
+— standard library only.
 
-Not done yet: JSON invoice input, multiple tax rates per line, a
-half-even rounding mode, and a JSON output mode for the CLI.
+Not done yet: multiple tax rates per line, a half-even rounding mode, and
+a JSON output mode for the CLI.
 
 ## License
 

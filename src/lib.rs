@@ -83,7 +83,7 @@ impl FromStr for Quantity {
 /// One priced line on an invoice: some quantity of a thing, a unit price,
 /// a discount, and a tax rate. `discount_bps` and `tax_bps` are basis
 /// points (1/100 of a percent), so 825 means 8.25%.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
     pub description: String,
     pub quantity: Quantity,
@@ -453,6 +453,439 @@ pub mod csv {
         #[test]
         fn empty_input_is_an_error() {
             assert_eq!(parse(""), Err(CsvError::MissingHeader));
+        }
+    }
+}
+
+/// Parses a JSON invoice into `LineItem`s: a top-level array of objects,
+/// one per line. `quantity` and `unit_price` must be given as JSON
+/// strings rather than numbers, for the same reason the CSV parser and the
+/// rest of this crate avoid `f64`: a JSON number is a float, and floats
+/// are exactly the representation this library exists to avoid.
+/// `discount_bps` and `tax_bps` are plain JSON integers and default to 0
+/// when omitted. There's no serde here — pulling one in for five fields
+/// isn't worth a dependency, so this hand-rolls just enough of the JSON
+/// grammar to read that shape.
+pub mod json {
+    use super::{LineItem, Money, Quantity};
+    use std::fmt;
+
+    const KNOWN: [&str; 5] = ["description", "quantity", "unit_price", "discount_bps", "tax_bps"];
+
+    #[derive(Debug, Clone, PartialEq)]
+    enum Value {
+        Null,
+        Bool(bool),
+        Number(f64),
+        String(String),
+        Array(Vec<Value>),
+        Object(Vec<(String, Value)>),
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum JsonError {
+        Syntax { pos: usize, message: String },
+        NotAnArray,
+        NotAnObject { index: usize },
+        MissingField { index: usize, field: &'static str },
+        WrongType { index: usize, field: &'static str, expected: &'static str },
+        InvalidField { index: usize, field: &'static str, message: String },
+        UnknownField { index: usize, field: String },
+    }
+
+    impl fmt::Display for JsonError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                JsonError::Syntax { pos, message } => write!(f, "syntax error at character {pos}: {message}"),
+                JsonError::NotAnArray => write!(f, "top-level JSON value must be an array of line items"),
+                JsonError::NotAnObject { index } => write!(f, "item {}: expected an object", index + 1),
+                JsonError::MissingField { index, field } => {
+                    write!(f, "item {}: missing required field {field:?}", index + 1)
+                }
+                JsonError::WrongType { index, field, expected } => {
+                    write!(f, "item {}: field {field:?} must be a {expected}", index + 1)
+                }
+                JsonError::InvalidField { index, field, message } => {
+                    write!(f, "item {}: field {field:?}: {message}", index + 1)
+                }
+                JsonError::UnknownField { index, field } => {
+                    write!(f, "item {}: unrecognized field {field:?}", index + 1)
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for JsonError {}
+
+    /// Parses a full JSON document into line items.
+    pub fn parse(input: &str) -> Result<Vec<LineItem>, JsonError> {
+        let mut parser = Parser::new(input);
+        parser.skip_ws();
+        let value = parser.parse_value()?;
+        parser.skip_ws();
+        if parser.pos != parser.chars.len() {
+            return Err(parser.error("unexpected trailing data after JSON value"));
+        }
+
+        let items = match value {
+            Value::Array(items) => items,
+            _ => return Err(JsonError::NotAnArray),
+        };
+
+        items.iter().enumerate().map(|(index, item)| line_item_from_value(index, item)).collect()
+    }
+
+    fn line_item_from_value(index: usize, value: &Value) -> Result<LineItem, JsonError> {
+        let fields = match value {
+            Value::Object(fields) => fields,
+            _ => return Err(JsonError::NotAnObject { index }),
+        };
+
+        for (name, _) in fields {
+            if !KNOWN.contains(&name.as_str()) {
+                return Err(JsonError::UnknownField { index, field: name.clone() });
+            }
+        }
+
+        let find = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v);
+
+        let description = match find("description") {
+            Some(Value::String(s)) => s.clone(),
+            Some(_) => return Err(JsonError::WrongType { index, field: "description", expected: "string" }),
+            None => return Err(JsonError::MissingField { index, field: "description" }),
+        };
+
+        let quantity = match find("quantity") {
+            Some(Value::String(s)) => s.parse::<Quantity>().map_err(|e| JsonError::InvalidField {
+                index,
+                field: "quantity",
+                message: e.to_string(),
+            })?,
+            Some(_) => return Err(JsonError::WrongType { index, field: "quantity", expected: "string" }),
+            None => return Err(JsonError::MissingField { index, field: "quantity" }),
+        };
+
+        let unit_price = match find("unit_price") {
+            Some(Value::String(s)) => s.parse::<Money>().map_err(|e| JsonError::InvalidField {
+                index,
+                field: "unit_price",
+                message: e.to_string(),
+            })?,
+            Some(_) => return Err(JsonError::WrongType { index, field: "unit_price", expected: "string" }),
+            None => return Err(JsonError::MissingField { index, field: "unit_price" }),
+        };
+
+        let discount_bps = match find("discount_bps") {
+            Some(Value::Number(n)) => number_to_bps(*n).ok_or_else(|| JsonError::InvalidField {
+                index,
+                field: "discount_bps",
+                message: format!("expected a non-negative integer, got {n}"),
+            })?,
+            Some(_) => return Err(JsonError::WrongType { index, field: "discount_bps", expected: "integer" }),
+            None => 0,
+        };
+
+        let tax_bps = match find("tax_bps") {
+            Some(Value::Number(n)) => number_to_bps(*n).ok_or_else(|| JsonError::InvalidField {
+                index,
+                field: "tax_bps",
+                message: format!("expected a non-negative integer, got {n}"),
+            })?,
+            Some(_) => return Err(JsonError::WrongType { index, field: "tax_bps", expected: "integer" }),
+            None => 0,
+        };
+
+        Ok(LineItem { description, quantity, unit_price, discount_bps, tax_bps })
+    }
+
+    fn number_to_bps(n: f64) -> Option<u32> {
+        if !n.is_finite() || n.fract() != 0.0 || n < 0.0 || n > u32::MAX as f64 {
+            None
+        } else {
+            Some(n as u32)
+        }
+    }
+
+    struct Parser {
+        chars: Vec<char>,
+        pos: usize,
+    }
+
+    impl Parser {
+        fn new(input: &str) -> Self {
+            Parser { chars: input.chars().collect(), pos: 0 }
+        }
+
+        fn peek(&self) -> Option<char> {
+            self.chars.get(self.pos).copied()
+        }
+
+        fn advance(&mut self) -> Option<char> {
+            let c = self.peek();
+            if c.is_some() {
+                self.pos += 1;
+            }
+            c
+        }
+
+        fn skip_ws(&mut self) {
+            while matches!(self.peek(), Some(' ') | Some('\t') | Some('\n') | Some('\r')) {
+                self.pos += 1;
+            }
+        }
+
+        fn error(&self, message: &str) -> JsonError {
+            JsonError::Syntax { pos: self.pos, message: message.to_string() }
+        }
+
+        fn parse_value(&mut self) -> Result<Value, JsonError> {
+            self.skip_ws();
+            match self.peek() {
+                Some('{') => self.parse_object(),
+                Some('[') => self.parse_array(),
+                Some('"') => self.parse_string().map(Value::String),
+                Some('t') => self.parse_literal("true", Value::Bool(true)),
+                Some('f') => self.parse_literal("false", Value::Bool(false)),
+                Some('n') => self.parse_literal("null", Value::Null),
+                Some(c) if c == '-' || c.is_ascii_digit() => self.parse_number(),
+                Some(_) => Err(self.error("unexpected character")),
+                None => Err(self.error("unexpected end of input")),
+            }
+        }
+
+        fn parse_object(&mut self) -> Result<Value, JsonError> {
+            self.pos += 1; // consume '{'
+            let mut fields = Vec::new();
+            self.skip_ws();
+            if self.peek() == Some('}') {
+                self.pos += 1;
+                return Ok(Value::Object(fields));
+            }
+            loop {
+                self.skip_ws();
+                if self.peek() != Some('"') {
+                    return Err(self.error("expected a string key"));
+                }
+                let key = self.parse_string()?;
+                self.skip_ws();
+                if self.advance() != Some(':') {
+                    return Err(self.error("expected ':' after object key"));
+                }
+                self.skip_ws();
+                let value = self.parse_value()?;
+                fields.push((key, value));
+                self.skip_ws();
+                match self.advance() {
+                    Some(',') => {}
+                    Some('}') => break,
+                    _ => return Err(self.error("expected ',' or '}' in object")),
+                }
+            }
+            Ok(Value::Object(fields))
+        }
+
+        fn parse_array(&mut self) -> Result<Value, JsonError> {
+            self.pos += 1; // consume '['
+            let mut items = Vec::new();
+            self.skip_ws();
+            if self.peek() == Some(']') {
+                self.pos += 1;
+                return Ok(Value::Array(items));
+            }
+            loop {
+                self.skip_ws();
+                let value = self.parse_value()?;
+                items.push(value);
+                self.skip_ws();
+                match self.advance() {
+                    Some(',') => {}
+                    Some(']') => break,
+                    _ => return Err(self.error("expected ',' or ']' in array")),
+                }
+            }
+            Ok(Value::Array(items))
+        }
+
+        fn parse_string(&mut self) -> Result<String, JsonError> {
+            self.pos += 1; // consume opening quote
+            let mut s = String::new();
+            loop {
+                match self.advance() {
+                    None => return Err(self.error("unterminated string")),
+                    Some('"') => break,
+                    Some('\\') => match self.advance() {
+                        Some('"') => s.push('"'),
+                        Some('\\') => s.push('\\'),
+                        Some('/') => s.push('/'),
+                        Some('b') => s.push('\u{8}'),
+                        Some('f') => s.push('\u{c}'),
+                        Some('n') => s.push('\n'),
+                        Some('r') => s.push('\r'),
+                        Some('t') => s.push('\t'),
+                        Some('u') => {
+                            let cp = self.parse_hex4()?;
+                            let resolved = if (0xD800..=0xDBFF).contains(&cp) {
+                                if self.advance() == Some('\\') && self.advance() == Some('u') {
+                                    let low = self.parse_hex4()?;
+                                    if (0xDC00..=0xDFFF).contains(&low) {
+                                        0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                                    } else {
+                                        return Err(self.error("invalid low surrogate in unicode escape"));
+                                    }
+                                } else {
+                                    return Err(self.error("unpaired high surrogate in unicode escape"));
+                                }
+                            } else {
+                                cp
+                            };
+                            s.push(char::from_u32(resolved).ok_or_else(|| self.error("invalid unicode escape"))?);
+                        }
+                        _ => return Err(self.error("invalid escape sequence")),
+                    },
+                    Some(c) => s.push(c),
+                }
+            }
+            Ok(s)
+        }
+
+        fn parse_hex4(&mut self) -> Result<u32, JsonError> {
+            let mut value = 0u32;
+            for _ in 0..4 {
+                let c = self.advance().ok_or_else(|| self.error("unterminated unicode escape"))?;
+                let digit = c.to_digit(16).ok_or_else(|| self.error("invalid hex digit in unicode escape"))?;
+                value = value * 16 + digit;
+            }
+            Ok(value)
+        }
+
+        fn parse_literal(&mut self, word: &str, value: Value) -> Result<Value, JsonError> {
+            for expected in word.chars() {
+                if self.advance() != Some(expected) {
+                    return Err(self.error(&format!("expected literal {word:?}")));
+                }
+            }
+            Ok(value)
+        }
+
+        fn parse_number(&mut self) -> Result<Value, JsonError> {
+            let start = self.pos;
+            if self.peek() == Some('-') {
+                self.pos += 1;
+            }
+            match self.peek() {
+                Some('0') => self.pos += 1,
+                Some(c) if c.is_ascii_digit() => {
+                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                        self.pos += 1;
+                    }
+                }
+                _ => return Err(self.error("invalid number")),
+            }
+            if self.peek() == Some('.') {
+                self.pos += 1;
+                if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    return Err(self.error("invalid number: expected a digit after '.'"));
+                }
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+            if matches!(self.peek(), Some('e') | Some('E')) {
+                self.pos += 1;
+                if matches!(self.peek(), Some('+') | Some('-')) {
+                    self.pos += 1;
+                }
+                if !matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    return Err(self.error("invalid number: expected a digit in exponent"));
+                }
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+            let text: String = self.chars[start..self.pos].iter().collect();
+            text.parse::<f64>().map(Value::Number).map_err(|_| self.error("invalid number"))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parses_required_fields_with_defaults() {
+            let input = r#"[{"description":"Widget","quantity":"2","unit_price":"5.00"}]"#;
+            let items = parse(input).unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].description, "Widget");
+            assert_eq!(items[0].quantity.to_string(), "2.000");
+            assert_eq!(items[0].unit_price.to_string(), "5.00");
+            assert_eq!(items[0].discount_bps, 0);
+            assert_eq!(items[0].tax_bps, 0);
+        }
+
+        #[test]
+        fn parses_optional_fields_across_whitespace_and_newlines() {
+            let input = "  [\n  {\n    \"description\": \"Consulting, on-site\",\n    \"quantity\": \"2.5\",\n    \"unit_price\": \"150.00\",\n    \"discount_bps\": 1000,\n    \"tax_bps\": 825\n  }\n]\n";
+            let items = parse(input).unwrap();
+            assert_eq!(items[0].discount_bps, 1000);
+            assert_eq!(items[0].tax_bps, 825);
+        }
+
+        #[test]
+        fn empty_array_is_valid() {
+            assert_eq!(parse("[]").unwrap().len(), 0);
+        }
+
+        #[test]
+        fn escaped_quote_in_description() {
+            let input = r#"[{"description":"6\" pipe","quantity":"1","unit_price":"1.00"}]"#;
+            let items = parse(input).unwrap();
+            assert_eq!(items[0].description, "6\" pipe");
+        }
+
+        #[test]
+        fn top_level_must_be_an_array() {
+            let input = r#"{"description":"Widget"}"#;
+            assert_eq!(parse(input), Err(JsonError::NotAnArray));
+        }
+
+        #[test]
+        fn missing_required_field_is_an_error() {
+            let input = r#"[{"quantity":"1","unit_price":"1.00"}]"#;
+            assert_eq!(parse(input), Err(JsonError::MissingField { index: 0, field: "description" }));
+        }
+
+        #[test]
+        fn unknown_field_is_an_error() {
+            let input = r#"[{"description":"Widget","quantity":"1","unit_price":"1.00","sku":"ABC"}]"#;
+            assert_eq!(parse(input), Err(JsonError::UnknownField { index: 0, field: "sku".to_string() }));
+        }
+
+        #[test]
+        fn quantity_must_be_a_string_not_a_number() {
+            let input = r#"[{"description":"Widget","quantity":2,"unit_price":"1.00"}]"#;
+            assert_eq!(
+                parse(input),
+                Err(JsonError::WrongType { index: 0, field: "quantity", expected: "string" })
+            );
+        }
+
+        #[test]
+        fn malformed_json_is_a_syntax_error() {
+            let input = r#"[{"description":"Widget",}]"#;
+            assert!(matches!(parse(input), Err(JsonError::Syntax { .. })));
+        }
+
+        #[test]
+        fn invalid_quantity_string_is_reported() {
+            let input = r#"[{"description":"Widget","quantity":"1.2345","unit_price":"1.00"}]"#;
+            assert!(matches!(parse(input), Err(JsonError::InvalidField { field: "quantity", .. })));
+        }
+
+        #[test]
+        fn second_item_index_is_reported_in_errors() {
+            let input = r#"[{"description":"Widget","quantity":"1","unit_price":"1.00"},{"quantity":"1","unit_price":"1.00"}]"#;
+            assert_eq!(parse(input), Err(JsonError::MissingField { index: 1, field: "description" }));
         }
     }
 }

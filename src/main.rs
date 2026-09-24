@@ -1,21 +1,26 @@
-// Thin CLI over the lineitems library: read a headered CSV invoice from a
-// file or stdin, print each line item priced out, and print a grand total.
-// All the actual math and parsing lives in the library; this just wires it
-// to text.
+// Thin CLI over the lineitems library: read an invoice from a file or
+// stdin, print each line item priced out, and print a grand total. All the
+// actual math and parsing lives in the library; this just wires it to
+// text. The invoice can be headered CSV or JSON; a `.json` file extension
+// selects the JSON parser; anything else (including stdin) is CSV unless
+// the input starts with `[`, since a CSV invoice can never start that way.
 
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use lineitems::{csv, Money};
+use lineitems::{csv, json, Money};
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
-    let input = match args.get(1) {
+    let (input, use_json) = match args.get(1) {
         Some(path) => match fs::read_to_string(path) {
-            Ok(s) => s,
+            Ok(s) => {
+                let use_json = path.rsplit('.').next() == Some("json");
+                (s, use_json)
+            }
             Err(err) => {
                 eprintln!("lineitems: cannot open {path}: {err}");
                 return ExitCode::FAILURE;
@@ -27,11 +32,18 @@ fn main() -> ExitCode {
                 eprintln!("lineitems: read error: {err}");
                 return ExitCode::FAILURE;
             }
-            buf
+            let use_json = buf.trim_start().starts_with('[');
+            (buf, use_json)
         }
     };
 
-    let items = match csv::parse(&input) {
+    let parsed = if use_json {
+        json::parse(&input).map_err(|e| e.to_string())
+    } else {
+        csv::parse(&input).map_err(|e| e.to_string())
+    };
+
+    let items = match parsed {
         Ok(items) => items,
         Err(err) => {
             eprintln!("lineitems: {err}");
