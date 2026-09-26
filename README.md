@@ -31,7 +31,7 @@ let item = LineItem {
     quantity: "2.5".parse::<Quantity>().unwrap(),   // 2.5 hours
     unit_price: "150.00".parse::<Money>().unwrap(), // $150.00/hr
     discount_bps: 1000,                             // 10% off
-    tax_bps: 825,                                   // 8.25% sales tax
+    tax_bps: vec![825],                             // 8.25% sales tax
 };
 
 let totals = item.totals().unwrap();
@@ -54,10 +54,14 @@ else is read as CSV, unless the input (including stdin) starts with `[`.
 
 CSV: the header names the columns present — `description`, `quantity`,
 and `unit_price` are required; `discount_bps` and `tax_bps` are optional
-and default to 0 when omitted, and columns can appear in any order. Blank
-lines and `#`-comments are skipped anywhere in the file, including before
-the header. A field can be double-quoted to contain a comma (`""` inside
-a quoted field is a literal quote):
+and default to 0 (no discount, no tax) when omitted, and columns can
+appear in any order. A line can carry more than one tax rate — state and
+local sales tax, say — by separating them with `;` in the `tax_bps` field
+(`"500;300"` for 5% and 3%, charged and rounded separately rather than
+pre-added into one 8% rate). Blank lines and `#`-comments are skipped
+anywhere in the file, including before the header. A field can be
+double-quoted to contain a comma (`""` inside a quoted field is a literal
+quote):
 
 ```
 # invoice.csv
@@ -78,8 +82,10 @@ grand total                                                                     
 JSON: a top-level array of objects, one per line item, with the same
 fields as the CSV columns. `quantity` and `unit_price` are given as JSON
 strings rather than numbers — a JSON number is a float, and floats are
-exactly what this library avoids. `discount_bps` and `tax_bps` are plain
-integers and default to 0 when omitted:
+exactly what this library avoids. `discount_bps` is a plain integer and
+defaults to 0 when omitted. `tax_bps` is either a single integer or an
+array of integers, for a line with more than one tax rate, and defaults
+to no tax when omitted:
 
 ```
 # invoice.json
@@ -105,8 +111,8 @@ serde — reading five fields off an array of objects doesn't justify a
 dependency. The CLI is deliberately minimal. No third-party dependencies
 — standard library only.
 
-Not done yet: multiple tax rates per line, a half-even rounding mode, and
-a JSON output mode for the CLI.
+Not done yet: a half-even rounding mode, and a JSON output mode for the
+CLI.
 
 ## License
 

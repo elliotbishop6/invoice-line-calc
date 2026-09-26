@@ -81,15 +81,21 @@ impl FromStr for Quantity {
 }
 
 /// One priced line on an invoice: some quantity of a thing, a unit price,
-/// a discount, and a tax rate. `discount_bps` and `tax_bps` are basis
-/// points (1/100 of a percent), so 825 means 8.25%.
+/// a discount, and zero or more tax rates. `discount_bps` and each entry
+/// in `tax_bps` are basis points (1/100 of a percent), so 825 means 8.25%.
+/// A line can carry more than one tax rate (state plus local sales tax,
+/// say) because those are usually set independently and each rounds to
+/// the nearest cent on its own rather than being pre-added into one rate;
+/// two 0.5% rates on a $1.00 line each round 0.5 cents up to a full cent,
+/// for two cents total, where a single pre-added 1% rate would round to
+/// one cent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineItem {
     pub description: String,
     pub quantity: Quantity,
     pub unit_price: Money,
     pub discount_bps: u32,
-    pub tax_bps: u32,
+    pub tax_bps: Vec<u32>,
 }
 
 /// The result of pricing a `LineItem`: subtotal, the discount taken off it,
@@ -124,8 +130,9 @@ impl std::error::Error for LineItemError {}
 impl LineItem {
     /// Computes subtotal, discount, tax, and total.
     ///
-    /// Discount is taken off the subtotal first, then tax is applied to
-    /// what's left; each step rounds to the nearest cent independently,
+    /// Discount is taken off the subtotal first, then each tax rate is
+    /// applied to what's left and summed; every step (the discount and
+    /// each individual tax rate) rounds to the nearest cent independently,
     /// rounding exact halves away from zero. That means a return (negative
     /// quantity) rounds its subtotal down in magnitude the same way a sale
     /// rounds up, rather than always rounding toward positive infinity.
@@ -137,7 +144,13 @@ impl LineItem {
         let subtotal = proportional(self.unit_price.cents(), self.quantity.as_thousandths(), 1000)?;
         let discount = proportional(subtotal.cents(), self.discount_bps as i64, 10_000)?;
         let after_discount = subtotal.checked_sub(discount).ok_or(LineItemError::Overflow)?;
-        let tax = proportional(after_discount.cents(), self.tax_bps as i64, 10_000)?;
+
+        let mut tax = Money::from_cents(0);
+        for &rate in &self.tax_bps {
+            let rate_tax = proportional(after_discount.cents(), rate as i64, 10_000)?;
+            tax = tax.checked_add(rate_tax).ok_or(LineItemError::Overflow)?;
+        }
+
         let total = after_discount.checked_add(tax).ok_or(LineItemError::Overflow)?;
 
         Ok(LineTotals { subtotal, discount, tax, total })
@@ -233,8 +246,10 @@ impl std::error::Error for ParseQuantityError {}
 
 /// Parses a headered CSV invoice into `LineItem`s. Column order in the
 /// header doesn't matter; `discount_bps` and `tax_bps` are optional and
-/// default to 0 when the column is absent, since most lines on a real
-/// invoice have neither a discount nor tax.
+/// default to no discount and no tax when the column is absent, since most
+/// lines on a real invoice have neither. `tax_bps` holds one or more
+/// semicolon-separated rates (`"500;300"` for a 5% and a 3% rate charged
+/// separately), since a single column still has to fit one CSV field.
 pub mod csv {
     use super::{LineItem, Money, Quantity};
     use std::fmt;
@@ -341,18 +356,30 @@ pub mod csv {
             };
 
             let tax_bps = match columns.tax_bps {
-                Some(i) => fields[i].parse::<u32>().map_err(|_| CsvError::InvalidField {
+                Some(i) => parse_tax_rates(&fields[i]).map_err(|message| CsvError::InvalidField {
                     line: line_no,
                     column: "tax_bps",
-                    message: format!("invalid integer {:?}", fields[i]),
+                    message,
                 })?,
-                None => 0,
+                None => Vec::new(),
             };
 
             items.push(LineItem { description, quantity, unit_price, discount_bps, tax_bps });
         }
 
         Ok(items)
+    }
+
+    /// Parses a `tax_bps` field into zero or more basis-point rates. An
+    /// empty field means no tax; multiple rates are joined with `;`.
+    fn parse_tax_rates(field: &str) -> Result<Vec<u32>, String> {
+        if field.is_empty() {
+            return Ok(Vec::new());
+        }
+        field
+            .split(';')
+            .map(|part| part.trim().parse::<u32>().map_err(|_| format!("invalid integer {part:?}")))
+            .collect()
     }
 
     /// Splits one CSV line into fields, honoring double-quoted fields (so a
@@ -407,7 +434,7 @@ pub mod csv {
             assert_eq!(items[0].quantity.to_string(), "2.000");
             assert_eq!(items[0].unit_price.to_string(), "10.00");
             assert_eq!(items[0].discount_bps, 0);
-            assert_eq!(items[0].tax_bps, 0);
+            assert_eq!(items[0].tax_bps, Vec::<u32>::new());
         }
 
         #[test]
@@ -429,7 +456,14 @@ pub mod csv {
             let input = "description,quantity,unit_price,tax_bps\nWidget,1,5.00,825\n";
             let items = parse(input).unwrap();
             assert_eq!(items[0].discount_bps, 0);
-            assert_eq!(items[0].tax_bps, 825);
+            assert_eq!(items[0].tax_bps, vec![825]);
+        }
+
+        #[test]
+        fn multiple_tax_rates_are_semicolon_separated() {
+            let input = "description,quantity,unit_price,tax_bps\nWidget,1,5.00,500;300\n";
+            let items = parse(input).unwrap();
+            assert_eq!(items[0].tax_bps, vec![500, 300]);
         }
 
         #[test]
@@ -462,8 +496,10 @@ pub mod csv {
 /// strings rather than numbers, for the same reason the CSV parser and the
 /// rest of this crate avoid `f64`: a JSON number is a float, and floats
 /// are exactly the representation this library exists to avoid.
-/// `discount_bps` and `tax_bps` are plain JSON integers and default to 0
-/// when omitted. There's no serde here — pulling one in for five fields
+/// `discount_bps` is a plain JSON integer and defaults to 0 when omitted.
+/// `tax_bps` is either a single integer or an array of integers (for more
+/// than one tax rate on the line) and defaults to an empty array when
+/// omitted. There's no serde here — pulling one in for five fields
 /// isn't worth a dependency, so this hand-rolls just enough of the JSON
 /// grammar to read that shape.
 pub mod json {
@@ -586,13 +622,26 @@ pub mod json {
         };
 
         let tax_bps = match find("tax_bps") {
-            Some(Value::Number(n)) => number_to_bps(*n).ok_or_else(|| JsonError::InvalidField {
+            Some(Value::Number(n)) => vec![number_to_bps(*n).ok_or_else(|| JsonError::InvalidField {
                 index,
                 field: "tax_bps",
                 message: format!("expected a non-negative integer, got {n}"),
-            })?,
-            Some(_) => return Err(JsonError::WrongType { index, field: "tax_bps", expected: "integer" }),
-            None => 0,
+            })?],
+            Some(Value::Array(rates)) => rates
+                .iter()
+                .map(|v| match v {
+                    Value::Number(n) => number_to_bps(*n).ok_or_else(|| JsonError::InvalidField {
+                        index,
+                        field: "tax_bps",
+                        message: format!("expected a non-negative integer, got {n}"),
+                    }),
+                    _ => Err(JsonError::WrongType { index, field: "tax_bps", expected: "integer or array of integers" }),
+                })
+                .collect::<Result<Vec<u32>, JsonError>>()?,
+            Some(_) => {
+                return Err(JsonError::WrongType { index, field: "tax_bps", expected: "integer or array of integers" })
+            }
+            None => Vec::new(),
         };
 
         Ok(LineItem { description, quantity, unit_price, discount_bps, tax_bps })
@@ -820,7 +869,7 @@ pub mod json {
             assert_eq!(items[0].quantity.to_string(), "2.000");
             assert_eq!(items[0].unit_price.to_string(), "5.00");
             assert_eq!(items[0].discount_bps, 0);
-            assert_eq!(items[0].tax_bps, 0);
+            assert_eq!(items[0].tax_bps, Vec::<u32>::new());
         }
 
         #[test]
@@ -828,7 +877,14 @@ pub mod json {
             let input = "  [\n  {\n    \"description\": \"Consulting, on-site\",\n    \"quantity\": \"2.5\",\n    \"unit_price\": \"150.00\",\n    \"discount_bps\": 1000,\n    \"tax_bps\": 825\n  }\n]\n";
             let items = parse(input).unwrap();
             assert_eq!(items[0].discount_bps, 1000);
-            assert_eq!(items[0].tax_bps, 825);
+            assert_eq!(items[0].tax_bps, vec![825]);
+        }
+
+        #[test]
+        fn multiple_tax_rates_are_a_json_array() {
+            let input = r#"[{"description":"Widget","quantity":"1","unit_price":"5.00","tax_bps":[500,300]}]"#;
+            let items = parse(input).unwrap();
+            assert_eq!(items[0].tax_bps, vec![500, 300]);
         }
 
         #[test]
@@ -896,14 +952,15 @@ mod tests {
 
     /// One row per awkward case we've hit or expect to hit: fractional
     /// quantities, credits (negative quantities), a discount that zeroes
-    /// tax, rounding exactly on a half cent in both directions, and the
-    /// two error paths (overflow, out-of-range discount).
+    /// tax, rounding exactly on a half cent in both directions, multiple
+    /// tax rates that round independently, and the two error paths
+    /// (overflow, out-of-range discount).
     struct Case {
         name: &'static str,
         quantity: i64,
         unit_price: i64,
         discount_bps: u32,
-        tax_bps: u32,
+        tax_bps: Vec<u32>,
         expected: Result<(i64, i64, i64, i64), LineItemError>,
     }
 
@@ -914,7 +971,7 @@ mod tests {
                 quantity: 2000,
                 unit_price: 500,
                 discount_bps: 0,
-                tax_bps: 0,
+                tax_bps: vec![],
                 expected: Ok((1000, 0, 0, 1000)),
             },
             Case {
@@ -922,7 +979,7 @@ mod tests {
                 quantity: 500,
                 unit_price: 3,
                 discount_bps: 0,
-                tax_bps: 0,
+                tax_bps: vec![],
                 expected: Ok((2, 0, 0, 2)),
             },
             Case {
@@ -930,7 +987,7 @@ mod tests {
                 quantity: -500,
                 unit_price: 3,
                 discount_bps: 0,
-                tax_bps: 0,
+                tax_bps: vec![],
                 expected: Ok((-2, 0, 0, -2)),
             },
             Case {
@@ -938,7 +995,7 @@ mod tests {
                 quantity: 0,
                 unit_price: 999,
                 discount_bps: 500,
-                tax_bps: 800,
+                tax_bps: vec![800],
                 expected: Ok((0, 0, 0, 0)),
             },
             Case {
@@ -946,7 +1003,7 @@ mod tests {
                 quantity: 1000,
                 unit_price: 100,
                 discount_bps: 150,
-                tax_bps: 0,
+                tax_bps: vec![],
                 expected: Ok((100, 2, 0, 98)),
             },
             Case {
@@ -954,7 +1011,7 @@ mod tests {
                 quantity: 1000,
                 unit_price: 500,
                 discount_bps: 10_000,
-                tax_bps: 2000,
+                tax_bps: vec![2000],
                 expected: Ok((500, 500, 0, 0)),
             },
             Case {
@@ -962,15 +1019,24 @@ mod tests {
                 quantity: 1000,
                 unit_price: 999,
                 discount_bps: 1000,
-                tax_bps: 825,
+                tax_bps: vec![825],
                 expected: Ok((999, 100, 74, 973)),
+            },
+            Case {
+                name: "two tax rates round independently and can sum to more than one \
+                       combined rate would",
+                quantity: 1000,
+                unit_price: 100,
+                discount_bps: 0,
+                tax_bps: vec![50, 50],
+                expected: Ok((100, 0, 2, 102)),
             },
             Case {
                 name: "quantity times price overflows an i64 cent count",
                 quantity: 2000,
                 unit_price: i64::MAX,
                 discount_bps: 0,
-                tax_bps: 0,
+                tax_bps: vec![],
                 expected: Err(LineItemError::Overflow),
             },
             Case {
@@ -978,7 +1044,7 @@ mod tests {
                 quantity: 1000,
                 unit_price: 100,
                 discount_bps: 10_001,
-                tax_bps: 0,
+                tax_bps: vec![],
                 expected: Err(LineItemError::InvalidDiscount(10_001)),
             },
         ]
@@ -992,7 +1058,7 @@ mod tests {
                 quantity: Quantity(case.quantity),
                 unit_price: Money(case.unit_price),
                 discount_bps: case.discount_bps,
-                tax_bps: case.tax_bps,
+                tax_bps: case.tax_bps.clone(),
             };
 
             let got = item
